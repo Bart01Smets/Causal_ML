@@ -1,0 +1,726 @@
+---
+title: "Causal Machine Learning assignment"
+author: "Thomas Sertijn, Bart Smets, Ilja Van Bever"
+date: "`r Sys.Date()`"
+output: 
+  bookdown::pdf_document2:
+    latex_engine: xelatex
+    number_sections: false
+    toc: false
+header-includes:
+  - \usepackage{tikz}
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(hdm)
+library(grf)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(knitr)
+#load data
+data(pension)
+library(ggdag)
+library(ggplot2)
+library(kableExtra)
+```
+
+```{r, echo = FALSE, cache=TRUE}
+# Cross-fitting
+set.seed(4321)
+# Reference doc:
+# https://grf-labs.github.io/grf/reference/causal_forest.html
+# https://grf-labs.github.io/grf/reference/regression_forest.html
+
+variables <- c("net_tfa", "e401", "age", "inc", "fsize", "educ", 
+          "marr", "twoearn", "db", "pira", "hown")
+
+
+Y <- pension$net_tfa
+A <- pension$e401
+X <- pension[, c("age", "inc", "fsize", "educ", 
+                                 "marr", "twoearn", "db", "pira", "hown")]
+AX <- pension[, c("e401", "age", "inc", "fsize", "educ", 
+                                 "marr", "twoearn", "db", "pira", "hown")]
+
+K <- 5 # set to 5!
+n <- nrow(X)
+folds <- sample(rep(1:K, length.out = n))
+# eps <- 0.05 # epsilon for truncation of propensity-scores
+
+Y_X_hat <- rep(NA, n)
+Y_AX_hat <- rep(NA, n)
+A_hat <- rep(NA, n)
+
+for (k in 1:K) {
+  
+  train <- which(folds != k)
+  test  <- which(folds == k)
+  
+  # E[Y|X] met regression forests
+  rf_Y_X <- regression_forest(X[train, ], Y[train])
+  Y_X_hat[test] <- predict(rf_Y_X, X[test, ])$predictions
+  
+  # E[A|X]
+  rf_A <- regression_forest(X[train, ], A[train])
+  A_hat[test] <- predict(rf_A, X[test, ])$predictions
+  # truncation propensity scores
+  #A_hat[test] <- pmin(pmax(A_hat_temp, eps), 1 - eps)
+  #A_hat[test] <- A_hat_temp
+  
+  # E[Y|A, L] (exercise 3)
+  rf_Y_AX <- regression_forest(AX[train, ], Y[train])
+  Y_AX_hat[test] <- predict(rf_Y_AX, AX[test, ])$predictions
+}
+```
+
+```{r, echo = FALSE, cache=TRUE}
+set.seed(4321)
+
+# Propensity scores
+pension$A_hat <- A_hat
+# 1a) Train Causal Forest
+causal_forest <- causal_forest(X = X, Y = Y, W = A,
+  Y.hat = Y_X_hat,
+  W.hat = A_hat,
+  num.trees = 2000,
+  min.node.size = 5
+)
+```
+
+```{r, echo = FALSE,cache=TRUE}
+set.seed(4321)
+# Extract CATE and variances
+tau.hat.oob <- predict(causal_forest, estimate.variance = TRUE)
+pension$CATE <- tau.hat.oob$predictions
+
+pension$CATE_se <- sqrt(tau.hat.oob$variance.estimates)
+
+# 95% betrouwbaarheidsintervallen
+pension$CATE_lower <- pension$CATE - 1.96 * pension$CATE_se
+pension$CATE_upper <- pension$CATE + 1.96 * pension$CATE_se
+```
+
+```{r, echo = FALSE, cache=TRUE, warning=FALSE}
+set.seed(4321)
+# Determining the ATE and his confidence interval
+ate <- average_treatment_effect(causal_forest,
+                               target.sample = "all",
+                               method = "AIPW")
+
+# ATE confidence intervals
+ci_low  <- ate[1] - 1.96 * ate[2]
+ci_high <- ate[1] + 1.96 * ate[2]
+```
+
+# 1.a Effect estimation with Causal Forests
+
+In the first phase causal forests were used to estimate the effect of eligibility for enrolling in a 401(k) plan on net financial assets, in function of age, income, family size, years of education, a married indicator, a two-earner status indicator, a defined benefit pension status indicator, an IRA (individual retirement account) participation indicator, and a home ownership indicator.
+
+The causal forest analysis reveals a causal effect of eligibility for enrollment in a 401(k) plan on accumulated net financial assets. The estimated Average Treatment Effect (ATE) equals `r round(ate[1], 3)`, indicating that individuals who are eligible for a 401(k) plan accumulate, on average, approximately \$`r round(ate[1], 3)` more in net financial assets than non-eligible individuals. The estimated standard error is \$`r round(ate[1], 3)`, resulting in a 95% confidence interval of [\$`r round(ate[1] - 1.96 * ate[2], 3)`, \$`r round(ate[1] + 1.96 * ate[2], 3)`]. Because the confidence interval is positive and larger than 0, we conclude that being eligible for the 401(k) has a significant and positive effect on the net financial assets of a person.
+
+In addition to the average treatment effect, the Conditional Average Treatment Effect (CATE) was examined to investigate heterogeneity in treatment effects across individuals with different covariate profiles. Figure \@ref(fig:comboplot-Q1) presents a histogram of the predicted CATE values. Most individuals have positive CATE values, although negative values are also observed. Thus, this suggests that for most covariate profiles, the treatment effect was expected to be positive, yet not for all profiles. Furthermore, the estimated CATE was plotted against income (Figure \@ref(fig:comboplot-Q1)), revealing a clear upward trend: the effect of 401(k) eligibility appears to increase with income. Thus, becoming eligible does have a positive impact on financial assets, but more strongly so for richer individuals.
+
+To better characterize this relationship, both a linear regression model and a smoothing spline regression (with $\lambda$ = 1) were fitted. The corresponding trends are displayed in Figures \@ref(fig:comboplot-Q1) and \@ref(fig:comboplot-Q1). While the estimated curves differ somewhat at higher income levels, this part of the income distribution contains relatively few observations, implying considerably greater uncertainty in this region.
+
+To assess the stability of the inverse probability weights, the distribution of the estimated propensity scores was also investigated using a histogram (Figure \@ref(fig:comboplot-Q1)). `r round(mean(A_hat < 0.01 | A_hat > 0.99), 2)`% of the scores were smaller than 0.01 or larger than 0.99, and only `r round(mean(A_hat < 0.05 | A_hat > 0.95), 2)`% of the scores were smaller than 0.05 or larger than 0.95. Overall, the propensity scores do not exhibit problematic extremes, so truncation of propensity scores is not needed.
+
+To estimate the propensity scores and outcomes, 5-fold cross-fitting was applied. The modeling was performed using Regression Forests, as described in the documentation of the GRF package (https://grf-labs.github.io/grf/reference/causal_forest.html).
+
+```{r fig-cate-inc-smooth, echo=FALSE, fig.cap="Treatment effect vs income (smoothing spline)", cache=TRUE, results = FALSE}
+set.seed(4321)
+
+# CATE modelled using smoothing spline (lambda=1)
+# spline fit
+fit <- smooth.spline(x = pension$inc,
+                     y = pension$CATE,
+                     lambda = 1)
+
+# voorspellingen op een rooster van x-waarden
+x_grid <- seq(min(pension$inc),
+              max(pension$inc),
+              length.out = 500)
+
+pred <- predict(fit, x = x_grid)
+
+# plot
+# dataframe maken voor ggplot
+pred_df <- data.frame(
+  inc = pred$x,
+  CATE = pred$y
+)
+
+# plot
+causal_treatinc <- ggplot(pension, aes(x = inc, y = CATE)) +
+  geom_point(alpha = 0.2) +
+  geom_line(data = pred_df,
+            aes(x = inc, y = CATE),
+            color = "blue",
+            linewidth = 1.2) +
+  labs(title = "Treatment effect vs income")
+```
+
+```{r fig-cate-inc-lm, echo=FALSE, fig.cap="Treatment effect vs income (linear model)", cache=TRUE, results = FALSE}
+set.seed(4321)
+# CATE modelled using linear model
+causal_lintreatincome <- ggplot(pension, aes(x = inc, y = CATE)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              color = "blue",
+              linewidth = 1.2) +
+  labs(title = "Treatment effect vs income")
+```
+
+```{r fig-cate-inc-unc, echo = FALSE, cache=TRUE, results = FALSE}
+set.seed(4321)
+# plot 95% CI's
+causal_treatinc_uncertain <- ggplot(pension, aes(x = inc, y = CATE)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(aes(ymin = CATE_lower, ymax = CATE_upper), stat = "smooth") +
+  labs(title = "Treatment effect vs income (with uncertainty)")
+```
+
+```{r fig-cate-hist, echo=FALSE, fig.cap="Histogram of the predicted CATE values", cache=TRUE, results = FALSE, fig.show='hide'}
+p_cate_hist <- ggplot(pension, aes(x = CATE)) +
+  geom_histogram(bins = 30) +
+  labs(title = "CATE", x = "CATE")
+```
+
+```{r fig-A-hist, echo = FALSE, cache=TRUE, results = FALSE, fig.show='hide'}
+p_prop_hist <- ggplot(data.frame(A_hat), aes(x = A_hat)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Propensity scores", x = "Propensity scores")
+```
+
+# 1.b. Conditioning on other variables
+It was previously stated that eligibility for a 401(k) could be taken as exchangeable conditional on income. However, conditioning on additional variables can have important implications depending on their role in the causal structure.
+
+## Role of Additional Variables in a Causal Diagram
+
+Including variables in an analysis can have different effects depending on their role in the causal diagram. We illustrate this with figures below.
+
+- *Collider*  
+  In the case of a collider *(Eligibility → Collider ← Outcome)*, conditioning on this variable introduces collider bias. Normally, this path would be blocked. However, conditioning on the collider opens this path and creates a spurious association between eligibility and net financial assets, which would bias our treatment effect. *IRA* could for example act as a *collider*, since individuals who are ineligible for a 401(k) may substitute toward an IRA as an alternative retirement savings vehicle, while wealthier individuals with higher net financial assets are also more likely to participate in an IRA.
+
+- *Mediator*  
+  In the case of a mediator *(Eligibility → Mediator → Outcome)*, part of the effect of eligibility is captured through an indirect effect (via the mediator). Conditioning on a mediator is therefore not incorrect, but it implies that the estimated effect is no longer the total effect.
+
+- *Common Cause*  
+  In the case of a common cause *(Eligibility ← Common Cause → Outcome)*, it is necessary to condition on this variable in the analysis. If a common cause is omitted, a backdoor pathway remains open, making the estimated effect of eligibility biased. This is because eligible and non-eligible individuals would then differ in characteristics, which also affect the outcome. We note that conditional exchangeability given only income is a strong assumption and this does not hold if there exist common causes of eligibility and the outcome. An example of a common cause would be *Age*, as older individuals are generally more likely to be eligible for a 401(k) program (stable full-time jobs, longer job tenure), while older people have in general more financial assets. 
+
+- *Variable Affecting Only Eligibility or Outcome*  
+  If a variable only affects eligibility, including it in the analysis does not introduce bias.  If a variable only affects the outcome and not eligibility, it can be included in the analysis.  
+  Including such variables may improve the efficiency of the estimation.
+
+\begin{figure}
+\centering
+\begin{tikzpicture}[>=stealth, thick]
+    % Nodes
+    \node[draw, rounded corners, inner sep=4pt] (L) at (3,6)   {Income (L)};
+    \node (C) at (3,4)   {Common Cause: Age (C)};
+    \node (A) at (0,2)   {Eligibility (A)};
+    \node (M) at (3,2)   {Mediator: / (M)};
+    \node (Y) at (6,2)   {Outcome (Y)};
+    \node (Z) at (3,0)   {Collider: IRA (Z)};
+
+    % Income affects A and Y
+    \draw[->] (L) -- (A);
+    \draw[->] (L) -- (Y);
+
+    % Common cause affects A and Y
+    \draw[->] (C) -- (A);
+    \draw[->] (C) -- (Y);
+
+    % Mediator structure
+    \draw[->] (A) -- (M);
+    \draw[->] (M) -- (Y);
+    \draw[->, bend right=30] (A) to (Y);  % direct effect
+
+    % Collider
+    \draw[->] (A) -- (Z);
+    \draw[->] (Y) -- (Z);
+\end{tikzpicture}
+\caption{Combined DAG showing collider, mediator, and common cause structures}
+\end{figure}
+
+# 2. Investigating heterogeneity based on subgroup analysis
+Based on the CATE predictions obtained from the causal forest, the data were split into four subgroups sorted on predicted treatment effects. This allows us to assess if the effect differs across individuals who were predicted to benefit more or less from eligibility.
+
+```{r, echo = FALSE, cache=TRUE, warning=FALSE}
+set.seed(4321)
+#Q2
+pension$quartiles <- ntile(pension$CATE, 4)
+
+# Just run the function explicitly for each quartile
+Q1_ATE <- average_treatment_effect(causal_forest, subset = (pension$quartiles == 1))
+Q2_ATE <- average_treatment_effect(causal_forest, subset = (pension$quartiles == 2))
+Q3_ATE <- average_treatment_effect(causal_forest, subset = (pension$quartiles == 3))
+Q4_ATE <- average_treatment_effect(causal_forest, subset = (pension$quartiles == 4))
+
+
+coef_1  <- Q1_ATE["estimate"]
+sd_1   <- Q1_ATE["std.err"]
+
+Low_CI_1  <- coef_1 - (1.96 * sd_1)
+High_CI_1 <- coef_1 + (1.96 * sd_1)
+
+coef_2  <- Q2_ATE["estimate"]
+sd_2   <- Q2_ATE["std.err"]
+
+Low_CI_2  <- coef_2 - (1.96 * sd_2)
+High_CI_2 <- coef_2 + (1.96 * sd_2)
+
+coef_3  <- Q3_ATE["estimate"]
+sd_3   <- Q3_ATE["std.err"]
+
+Low_CI_3  <- coef_3 - (1.96 * sd_3)
+High_CI_3 <- coef_3 + (1.96 * sd_3)
+
+coef_4  <- Q4_ATE["estimate"]
+sd_4   <- Q4_ATE["std.err"]
+
+Low_CI_4  <- coef_4 - (1.96 * sd_4)
+High_CI_4 <- coef_4 + (1.96 * sd_4)
+
+
+
+# Create compact table for quartile-specific ATEs
+quartile_results <- data.frame(
+  Quartile = c(
+    "Q1 (lowest predicted CATE)",
+    "Q2",
+    "Q3",
+    "Q4 (highest predicted CATE)"
+  ),
+  Estimate = c(coef_1, coef_2, coef_3, coef_4),
+  SE = c(sd_1, sd_2, sd_3, sd_4),
+  CI_low = c(Low_CI_1, Low_CI_2, Low_CI_3, Low_CI_4),
+  CI_high = c(High_CI_1, High_CI_2, High_CI_3, High_CI_4)
+)
+knitr::kable(
+  quartile_results,
+  digits = 2,
+  caption = "ATE estimates by predicted CATE quartile"
+) %>%
+  kableExtra::kable_styling(latex_options = "hold_position")
+```
+
+We find that the estimated treatment effect is positive in all four quartiles. This implies that, on average, 401(k) eligibility has a positive impact on net financial assets for the complete distribution, even for those benefiting the least from the policy. However, this treatment effect differs across subgroups. The estimated ATE increases across the four predicted-CATE quartiles: approximately 
+\$`r round(quartile_results$Estimate[1], 0)` in Q1, 
+\$`r round(quartile_results$Estimate[2], 0)` in Q2, 
+\$`r round(quartile_results$Estimate[3], 0)` in Q3, and 
+\$`r round(quartile_results$Estimate[4], 0)` in Q4. This implies that individuals who were predicted to benefit the most from being eligible based on the causal forest, indeed do experience a larger treatment effect, and thus the causal forest performs rather well. 
+ 
+This also suggests meaningful treatment effect heterogeneity. While adjacent quartiles have overlapping confidence intervals (e.g. Q1 overlaps with Q2), the 95% confidence interval for Q1 [\$`r round(quartile_results$CI_low[1], 2)`, \$`r round(quartile_results$CI_high[1], 2)`] does not overlap with the confidence interval for Q4 [\$`r round(quartile_results$CI_low[4], 2)`, \$`r round(quartile_results$CI_high[4], 2)`]. This indicates that the treatment effect in the highest quartile is significantly different from the lowest quartile, meaning that these groups differ in their estimated treatment effects. The width of confidence intervals also increases among the quartiles, as there is greater uncertainty among the treatment effect for these benefiting the most.
+
+Overall, this implies that 401(k) eligibility increases net financial assets for all groups, but the estimated gains are substantially larger for the subgroup with the highest predicted treatment effects and there is thus proof of treatment effect heterogeneity. This is because individuals in the highest quartile likely have a higher income, meaning that they can benefit more from becoming eligible than individuals with a lower income.
+
+# 3. Investigating heterogeneity using the Efficient Influence Function
+In this exercise, we compute the variance derived from the Efficient Influence Function (EIF). This gives a debiased estimator of treatment effect heterogeneity, which adds a correction term to account for the fact that the nuisance functions are estimated.
+
+```{r, echo = FALSE, cache=TRUE, results = FALSE, warning=FALSE}
+set.seed(4321)
+#Q3
+
+## CATE predictions (E(Y1-Y0)/L)
+CATEhat<-pension$CATE
+
+## Prop score (P(A=1/L))
+propscore <- A_hat 
+
+# Get actual average treatment effect (E(Y1-Y0))
+atehat<-average_treatment_effect(causal_forest)["estimate"]
+
+## E(Y/A,L)
+
+Y_AX_hat
+
+# Fill in the formula for the EIF
+
+# (Squared difference CATE and ATE) (Term 1)
+term1<-(CATEhat-atehat)^2
+
+# Inverse Probability Weights (Term 2)
+term2<-(A/propscore)- ((1-A)/(1-propscore))
+
+# Residuals (Term 3)
+term3<-(Y-Y_AX_hat)
+  
+# Combine to get efficient influence function
+sigma_sq_hat<-mean(term1+2*(CATEhat-atehat)*term2*term3)
+# estimate sigma^2, mean(EIF)=0 per definition
+IF_sigma<- term1 - sigma_sq_hat +2 * (CATEhat - atehat) * term2 * term3
+#get standard error of sigma_sq_est
+# ss = sample size
+ss<-length(IF_sigma)
+sigma_sq_se<- sd(IF_sigma)/sqrt(ss)
+#get CI
+high_ci<-sigma_sq_hat+1.96*sigma_sq_se
+low_ci<-sigma_sq_hat-1.96*sigma_sq_se
+
+
+cat("Estimated Variance (Sigma^2):", sigma_sq_hat, "\n")
+cat("95% CI: [", low_ci, ",", high_ci, "]\n")
+```
+
+```{r, echo = FALSE, cache=TRUE, results = FALSE}
+
+cate_dev <- CATEhat - atehat
+correction_term <- 2 * cate_dev * term2 * term3
+
+IF_drivers <- data.frame(
+  abs_IF = abs(IF_sigma),
+  abs_CATE_dev = abs(cate_dev),
+  abs_IPW = abs(term2),
+  abs_residual = abs(term3),
+  net_tfa = Y,
+  propensity = propscore
+)
+
+cut_IF_99 <- quantile(IF_drivers$abs_IF, 0.99, na.rm = TRUE)
+
+IF_drivers <- IF_drivers %>%
+  mutate(
+    group = ifelse(abs_IF >= cut_IF_99,
+                   "Top 1% |IF|",
+                   "Remaining 99%")
+  )
+
+IF_report_table <- IF_drivers %>%
+  group_by(group) %>%
+  summarise(
+    n = n(),
+    `Mean net financial assets` = mean(net_tfa, na.rm = TRUE),
+    `Mean |residual|` = mean(abs_residual, na.rm = TRUE),
+    `Mean |CATE - ATE|` = mean(abs_CATE_dev, na.rm = TRUE),
+    `Mean |IPW|` = mean(abs_IPW, na.rm = TRUE),
+    `Propensity range` = paste0(
+      round(min(propensity, na.rm = TRUE), 2),
+      "–",
+      round(max(propensity, na.rm = TRUE), 2)
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(group == "Top 1% |IF|"))
+
+knitr::kable(
+  IF_report_table,
+  digits = 2,
+  caption = "Comparison of the most influential observations with the rest of the sample"
+)
+
+```
+
+
+The key property that we use, to compute this variance, is that the expectation of the efficient influence function is equal to 0. Therefore, by taking expectations and isolating the variance, we write the variance in terms of quantities that were already estimated. This includes the estimated CATE, estimated ATE, the propensity score and outcome residuals. We then plug these estimates into the formula to calculate \hat{\sigma}^2. We can then also compute the efficient influence function values, which we can use to calculate the standard error and corresponding 95% confidence interval.The full derivation is described more formally and in detail in the appendix.
+
+Our estimate for the variance is approximately \(\hat{\sigma}^2 = `r formatC(sigma_sq_hat, format = "e", digits = 2)`\), (SE = `r formatC(sigma_sq_se, format = "e", digits = 2)`), with a 95% confidence interval of [`r formatC(low_ci, format = "e", digits = 2). As \(\sigma^2\) denotes the variance, the true parameter cannot be negative in practice. However, as we use the debiased estimator, it can be shown that estimates are not constrained to be positive. To see this, consider that the squared term of the EIF is always positive (as it is squared), however the correction term can be negative. If this is the case, the resulting variance is negative.
+
+A variance estimate of 0 would indicate a homogenous treatment effect, while an estimate different from 0 indicates a heterogenous treatment effect. Our estimate of the variance is positive, which suggests a heterogenous treatment effect. However, we can also see that there are very large confidence intervals, which include 0. As this is the case, this implies that we cannot reject the null hypothesis of a homogenous treatment effect. Thus, although the point estimate suggests some treatment-effect heterogeneity, the uncertainty around this estimate is too large to conclude that the effect of 401(k) eligibility differs significantly across households.
+
+Because the confidence intervals are rather large; (\(\hat{\sigma}^2 = `r round(sigma_sq_hat, 2)`\), 95% CI 
+[`r round(low_ci, 2)`, `r round(high_ci, 2)`]), we also inspect what drives this. For this purpose, we inspect whether this result is caused by a few observations with extreme EIF values. We find that the largest EIF value equals 
+`r round(max(abs(IF_sigma), na.rm = TRUE), 2)`, while the 99th percentile equals 
+`r round(quantile(abs(IF_sigma), 0.99, na.rm = TRUE), 2). Thus, we have extreme influence function values, which lead to very large confidence intervals. Next, we inspect where these extreme values come from by compare these observations for the top 1% versus the top 99% of the population.
+
+As shown in Table X, the extreme EIF values are the result of both large residuals and CATE-ATE deviations. The mean absolute residual among the top 1% most influential observations is 
+`r round(IF_report_table$`Mean |residual|`[IF_report_table$group == "Top 1% |IF|"], 2)`, compared with 
+`r round(IF_report_table$`Mean |residual|`[IF_report_table$group == "Remaining 99%"], 2)` for the rest of the sample. These extreme values for these observations are the result of higher net financial assets on average: 
+`r round(IF_report_table$`Mean net financial assets`[IF_report_table$group == "Top 1% |IF|"], 2)`, compared with 
+`r round(IF_report_table$`Mean net financial assets`[IF_report_table$group == "Remaining 99%"], 2)`. This indicates that several high-asset households have observed outcomes that are substantially larger than predicted by the outcome model. The CATE-ATE deviations are also larger for these influential observations, indicating that they have more extreme predicted treatment effects, and thus also contribute strongly to the extreme EIF values. The inverse probability weights among these extreme EIF values are not very large, indicating that extreme values are not driven by unstable probability weights.
+
+
+# 4. Estimation of the causal effect using a orthogonal R-learner
+The causal forests that were used in the previous phases have the drawback that they learn the causal effect conditional on many variables, making it both difficult to learn with good accuracy and difficult to visualize. In this fourth phase, we therefore estimate the average effect of eligibility for enrollment in a 401(k) plan on net financial assets conditional only on income. For this purpose, an orthogonal R-learner is used, controlling for the same set of covariates as before to ensure valid confounding adjustment. While both DR learner and the R-learner are theoretically sound to use in this case, it was ultimately decided to implement the R-learner. The R-Learner was chosen because it is more robust to the local overlap failures visible in the propensity score plot.
+
+This plot gives the estimated probability of being eligible for 401(k), based on observed covariates, split by treatment status. We can see that failures occur on the far left (low propensity scores), as here the data is mainly composed of observations from not eligible group, with almost no eligible individuals to compare them to. In contrast, on the far right (high propensity scores), we see that there are mainly eligible individuals. This lack of overlap is problematic for the DR-Learner, as it amplifies errors through IPW division and requires explicit truncation, introducing bias. The R-Learner instead naturally downweights those observations via W_R = (Aᵢ − Âᵢ)², making it less likely that truncation is necessary.
+
+```{r, echo = FALSE, cache=TRUE}
+set.seed(4321)
+# Q4
+# R-learner implementation
+# Assumptions
+# 1) 
+
+# Reference: solutions of lab Causal Prediction
+# Other method: https://rdrr.io/github/xnie/rlearner/man/rboost.html
+
+K <- 6 # set to 6 -> 6-fold CF for outer loop and 5-fold DF for inner loop
+
+variables <- c("net_tfa", "e401", "age", "inc", "fsize", "educ", 
+          "marr", "twoearn", "db", "pira", "hown")
+
+Y <- pension$net_tfa
+A <- pension$e401
+X <- pension[, c("age", "inc", "fsize", "educ", 
+                                 "marr", "twoearn", "db", "pira", "hown")]
+AX <- pension[, c("e401", "age", "inc", "fsize", "educ", 
+                               "marr", "twoearn", "db", "pira", "hown")]
+n <- nrow(X)
+eps <- 0.01 # epsilon for truncation of propensity-scores
+
+Yx_hat <- matrix(NA, nrow = n, ncol = K)
+A_hat <- matrix(NA, nrow = n, ncol = K)
+C_R <- matrix(NA, nrow = n, ncol = K)
+W_R <- matrix(NA, nrow = n, ncol = K)
+CATE <- rep(NA, n)
+```
+
+```{r, echo = FALSE, cache=TRUE}
+set.seed(4321)
+# Q4
+# Random folds
+# folds <- sample(rep(1:K, length.out = n))
+
+# Stratified folds
+folds <- rep(NA, n)
+
+# indices per class
+idx0 <- which(A == 0)
+idx1 <- which(A == 1)
+
+# random sampling within classes
+idx0 <- sample(idx0)
+idx1 <- sample(idx1)
+
+# folds
+folds[idx0] <- rep(1:K, length.out = length(idx0))
+folds[idx1] <- rep(1:K, length.out = length(idx1))
+```
+
+```{r, echo = FALSE, cache=TRUE}
+set.seed(4321)
+# Q4
+# R-learner implementation
+# Loop
+
+for (l in 1:K) {
+  
+  k_range <- 1:K
+  k_range <- k_range[k_range != l]
+  
+  for (k in k_range) {
+    train_k <- folds %in% k_range & folds != k
+    test_k <- folds == k
+    
+    # E[Y|X]
+    rf_Yx <- regression_forest(X[train_k, ], Y[train_k])
+    Yx_hat[test_k, l] <- predict(rf_Yx, X[test_k, ])$predictions
+    
+    # E[A|X]
+    rf_A <- regression_forest(X[train_k, ], A[train_k])
+    A_hat_temp <- predict(rf_A, X[test_k, ])$predictions
+    A_hat[test_k, l] <- A_hat_temp
+  }
+  
+  train <- folds != l
+  test <- folds == l
+  
+  # Prevent problems with dividing to zero
+  denom <- A[train] - A_hat[train, l]
+  eps <- 1e-6
+  denom[abs(denom) < eps] <- eps
+
+  # pseudooutcomes C
+  C_R[train, l] <- (Y[train] - Yx_hat[train, l]) / denom
+    
+  # weights for regression of the pseudooutcomes in the combined training data set using weighted linear model
+  W_R[train, l] <- denom^2
+    
+  # training dataframe
+  train_df <- data.frame(
+    C_R = C_R[train, l],
+    W_R = W_R[train, l],
+    inc = X[train, "inc"]
+  )
+  
+  # omit columns with NA values before regression
+  # train_df <- na.omit(train_df)#
+  
+  # Regress the pseudooutcomes in the combined training data set
+  lm_fit <- lm(C_R ~ inc, data = train_df, weights = W_R, na.action = na.fail)
+
+  # test dataframe
+  test_df <- data.frame(
+    inc = X[test, "inc"]
+  )
+
+  # Predict CATE on the test set
+  CATE[test] <- predict(lm_fit, newdata = test_df)
+}
+
+
+```
+
+```{r, echo = FALSE, include=FALSE, cache=TRUE}
+set.seed(4321)
+# ATE calculations
+# The ATE should be equal to the mean of the CATE
+mean(CATE)
+se_hat  <- sd(CATE) / sqrt(n)
+se_hat
+```
+
+We estimated the CATE of 401(k) eligibility on net financial assets using an R-Learner, with nuisance components estimated via random forests and the final stage modeled as a weighted linear regression on income. Compared to the causal forest approach in question 1, 2, 3, which attempts to quantify the value of the heterogeneity, the R-Learner more directly answers the research question by characterizing how the treatment effect varies with income. The linear final stage improves interpretability but adds the assumption that there is a linear relationship between income and the treatment effect, introducing misspecification risk if the true relationship is nonlinear. Next to this, working with the R-learner also assumes that the Neyman orthogonality condition holds, which mean that the conditional means of the residuals are zero. This is a strong assumption, and if it does not hold, the estimates may be biased.
+The resulting CATEs show a similar pattern to the causal forest: mostly positive values with a right tail of larger effects, though the R-Learner produces a more concentrated distribution. The derived ATE is `r mean(CATE)` (SE: `r se_hat`), consistent across folds, confirming stable calibration. The cross-fold plot shows all five folds intersecting near the mean ATE and following similar linear trends, though high-income observations with large CATEs visibly pull the fit.
+Diagnostically, the predicted outcomes E[Y] are right-skewed, reflecting heterogeneity in outcome potential and possible sensitivity to outliers. Together, these diagnostics support the reliability and robustness of the estimated CATEs and ATE.
+
+\newpage
+# Addendum:
+
+## Q1:
+
+```{r comboplot-Q1, echo = FALSE, cache=TRUE, results = FALSE, warning=FALSE, fig.cap="Figures related to Question 1"}
+wrap_plots(
+  causal_treatinc, causal_lintreatincome, causal_treatinc_uncertain,
+  p_cate_hist, p_prop_hist,
+  ncol = 2
+)
+```
+
+## Q3
+
+Starting from the efficient influence function,
+
+\[
+\begin{aligned}
+\phi(O)
+=& \{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}^2-\sigma^2 \\
+&+2\{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}
+\left\{
+\frac{A}{P(A=1\mid L)}
+-
+\frac{1-A}{P(A=0\mid L)}
+\right\} \\
+&\times \{Y-E(Y\mid A,L)\}.
+\end{aligned}
+\]
+
+Since the efficient influence function has mean zero,
+
+\[
+E\{\phi(O)\}=0.
+\]
+
+Taking the expectation of the full expression gives
+
+\[
+\begin{aligned}
+E\Bigg[
+&\{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}^2-\sigma^2 \\
+&+2\{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}
+\left\{
+\frac{A}{P(A=1\mid L)}
+-
+\frac{1-A}{P(A=0\mid L)}
+\right\} \\
+&\times \{Y-E(Y\mid A,L)\}
+\Bigg]=0.
+\end{aligned}
+\]
+
+We can therefore isolate \(\sigma^2\) as
+
+\[
+\begin{aligned}
+\sigma^2 =
+E\Bigg[
+&\{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}^2 \\
+&+2\{E(Y^1-Y^0\mid L)-E(Y^1-Y^0)\}
+\left\{
+\frac{A}{P(A=1\mid L)}
+-
+\frac{1-A}{P(A=0\mid L)}
+\right\} \\
+&\times \{Y-E(Y\mid A,L)\}
+\Bigg].
+\end{aligned}
+\]
+
+Thus, we estimate \(\sigma^2\) by replacing the unknown quantities by estimates and taking the empirical average:
+
+\[
+\begin{aligned}
+\hat{\sigma}^2 =
+\frac{1}{n}\sum_{i=1}^n
+\Bigg[
+&\{\widehat{E}(Y^1-Y^0\mid L_i)-\widehat{E}(Y^1-Y^0)\}^2 \\
+&+2\{\widehat{E}(Y^1-Y^0\mid L_i)-\widehat{E}(Y^1-Y^0)\}
+\left\{
+\frac{A_i}{\hat{P}(A=1\mid L_i)}
+-
+\frac{1-A_i}{\hat{P}(A=0\mid L_i)}
+\right\} \\
+&\times \{Y_i-\widehat{E}(Y_i\mid A_i,L_i)\}
+\Bigg].
+\end{aligned}
+\]
+
+Here, \(\widehat{E}(Y^1-Y^0\mid L_i)\) is the estimated CATE from the causal forest, \(\widehat{E}(Y^1-Y^0)\) is the estimated ATE, \(\hat{P}(A=1\mid L_i)\) and \(\hat{P}(A=0\mid L_i)\) are the estimated propensity scores, and \(\widehat{E}(Y_i\mid A_i,L_i)\) is the estimated outcome regression.
+
+The estimated influence-function values are
+
+\[
+\begin{aligned}
+\hat{\phi}_i
+=& \{\widehat{E}(Y^1-Y^0\mid L_i)-\widehat{E}(Y^1-Y^0)\}^2-\hat{\sigma}^2 \\
+&+2\{\widehat{E}(Y^1-Y^0\mid L_i)-\widehat{E}(Y^1-Y^0)\}
+\left\{
+\frac{A_i}{\hat{P}(A=1\mid L_i)}
+-
+\frac{1-A_i}{\hat{P}(A=0\mid L_i)}
+\right\} \\
+&\times \{Y_i-\widehat{E}(Y_i\mid A_i,L_i)\}.
+\end{aligned}
+\]
+
+The standard error was estimated as
+
+\[
+\widehat{SE}(\hat{\sigma}^2)
+=
+\frac{sd(\hat{\phi}_i)}{\sqrt{n}},
+\]
+
+and the 95\% confidence interval was computed as
+
+\[
+\hat{\sigma}^2
+\pm
+1.96 \times \widehat{SE}(\hat{\sigma}^2).
+\]
+
+## Q4 figures:
+
+
+```{r, echo = FALSE, cache=TRUE}
+set.seed(4321)
+
+# was: hist(CATE, ...)
+p_cate_rlearn <- ggplot(data.frame(CATE), aes(x = CATE)) +
+  geom_histogram(bins = 30) +
+  labs(title = "CATE")
+
+# was: unnamed ggplot
+pension$CATE_r <- CATE
+p_cate_inc_rlearn <- ggplot(pension, aes(x = inc, y = CATE_r)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth() +
+  labs(title = "Treatment effect vs income")
+
+# was: two hist() calls
+A_hat_vector <- rowSums(A_hat, na.rm = TRUE)/(K-1)
+
+p_exp_response <- ggplot(data.frame(x = rowSums(Yx_hat, na.rm = TRUE)/(K-1)), aes(x)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Expected responses", x = "E[Y]")
+
+p_prop_rlearn <- ggplot(data.frame(x = A_hat_vector), aes(x)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Propensity scores", x = "Propensity-score")
+
+(p_cate_rlearn | p_cate_inc_rlearn) /
+(p_exp_response | p_prop_rlearn)
+```
